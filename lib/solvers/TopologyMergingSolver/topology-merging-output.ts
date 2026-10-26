@@ -161,19 +161,32 @@ export function validateTopologyMergingOutput({
     }
   }
 
-  for (let aIndex = 0; aIndex < nodes.length; aIndex++) {
-    const nodeA = nodes[aIndex]!
-    for (let bIndex = aIndex + 1; bIndex < nodes.length; bIndex++) {
-      const nodeB = nodes[bIndex]!
+  const nodesWithBounds = nodes
+    .map((node) => ({
+      node,
+      bounds: getCapacityMeshNodeBounds(node),
+    }))
+    .sort((a, b) => a.bounds.minX - b.bounds.minX)
+
+  for (let aIndex = 0; aIndex < nodesWithBounds.length; aIndex++) {
+    const { node: nodeA, bounds: boundsA } = nodesWithBounds[aIndex]!
+    for (let bIndex = aIndex + 1; bIndex < nodesWithBounds.length; bIndex++) {
+      const { node: nodeB, bounds: boundsB } = nodesWithBounds[bIndex]!
+      if (boundsB.minX >= boundsA.maxX - TOPOLOGY_PROVENANCE_EPSILON) {
+        break
+      }
+      if (
+        boundsA.minY >= boundsB.maxY - TOPOLOGY_PROVENANCE_EPSILON ||
+        boundsA.maxY <= boundsB.minY + TOPOLOGY_PROVENANCE_EPSILON
+      ) {
+        continue
+      }
       const sharedLayers = nodeA.availableZ.filter((z) =>
         nodeB.availableZ.includes(z),
       )
       if (sharedLayers.length === 0) continue
 
-      const intersection = getBoundsIntersection(
-        getCapacityMeshNodeBounds(nodeA),
-        getCapacityMeshNodeBounds(nodeB),
-      )
+      const intersection = getBoundsIntersection(boundsA, boundsB)
       if (!intersection) continue
       const intersectionWidth = intersection.maxX - intersection.minX
       const intersectionHeight = intersection.maxY - intersection.minY

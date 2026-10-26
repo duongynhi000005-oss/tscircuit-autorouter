@@ -4,8 +4,8 @@ import type { CapacityMeshNode } from "lib/types"
 import { createRectFromCapacityNode } from "lib/utils/createRectFromCapacityNode"
 import { prepareTopologyMergingInput } from "./topology-merging-input"
 import {
-  createTopologyMergingOutputNodes,
   type TopologyMergingOutputProvenance,
+  createTopologyMergingOutputNodes,
   validateTopologyMergingOutput,
 } from "./topology-merging-output"
 import {
@@ -27,6 +27,166 @@ export type {
   TopologyMergingSolverParams,
 } from "./topology-merging-types"
 
+type TopologyMergingXSlab = {
+  minX: number
+  maxX: number
+  nodes: PreparedTopologyMergingNode[]
+}
+
+function hasInteriorOverlap(
+  a: PreparedTopologyMergingNode,
+  b: PreparedTopologyMergingNode,
+): boolean {
+  return (
+    a.bounds.minX < b.bounds.maxX - TOPOLOGY_MERGING_EPSILON &&
+    a.bounds.maxX > b.bounds.minX + TOPOLOGY_MERGING_EPSILON &&
+    a.bounds.minY < b.bounds.maxY - TOPOLOGY_MERGING_EPSILON &&
+    a.bounds.maxY > b.bounds.minY + TOPOLOGY_MERGING_EPSILON
+  )
+}
+
+function sharesAvailableLayer(
+  a: PreparedTopologyMergingNode,
+  b: PreparedTopologyMergingNode,
+): boolean {
+  for (const z of a.node.availableZ) {
+    if (b.node.availableZ.includes(z)) return true
+  }
+  return false
+}
+
+function buildFullXSlabs(
+  preparedNodes: PreparedTopologyMergingNode[],
+): TopologyMergingXSlab[] {
+  const xCoordinates = getCanonicalCoordinates(
+    preparedNodes.flatMap(({ bounds }) => [bounds.minX, bounds.maxX]),
+  )
+  const xSlabs: TopologyMergingXSlab[] = []
+  for (let xIndex = 0; xIndex < xCoordinates.length - 1; xIndex++) {
+    const minX = xCoordinates[xIndex]!
+    const maxX = xCoordinates[xIndex + 1]!
+    if (maxX - minX <= TOPOLOGY_MERGING_EPSILON) continue
+    const x = (minX + maxX) / 2
+    const nodesInXSlab = preparedNodes.filter(
+      ({ bounds }) =>
+        x >= bounds.minX - TOPOLOGY_MERGING_EPSILON &&
+        x <= bounds.maxX + TOPOLOGY_MERGING_EPSILON,
+    )
+    if (nodesInXSlab.length > 0) {
+      xSlabs.push({ minX, maxX, nodes: nodesInXSlab })
+    }
+  }
+  return xSlabs
+}
+
+function buildInteractiveClustersAndPassthroughRegions(
+  preparedNodes: PreparedTopologyMergingNode[],
+): {
+  passthroughRegions: TopologyMergingRegion[]
+  xSlabs: TopologyMergingXSlab[]
+} {
+  const sortedByMinX = [...preparedNodes].sort(
+    (a, b) => a.bounds.minX - b.bounds.minX,
+  )
+  const interactiveKeys = new Set<string>()
+  const overlapAdjacency = new Map<string, PreparedTopologyMergingNode[]>()
+
+  for (let i = 0; i < sortedByMinX.length; i++) {
+    const nodeA = sortedByMinX[i]!
+    for (let j = i + 1; j < sortedByMinX.length; j++) {
+      const nodeB = sortedByMinX[j]!
+      if (nodeB.bounds.minX >= nodeA.bounds.maxX - TOPOLOGY_MERGING_EPSILON) {
+        break
+      }
+      if (nodeA.groupIndex === nodeB.groupIndex) continue
+      if (!hasInteriorOverlap(nodeA, nodeB)) continue
+      if (!sharesAvailableLayer(nodeA, nodeB)) continue
+
+      interactiveKeys.add(nodeA.sourceKey)
+      interactiveKeys.add(nodeB.sourceKey)
+
+      let listA = overlapAdjacency.get(nodeA.sourceKey)
+      if (!listA) {
+        listA = []
+        overlapAdjacency.set(nodeA.sourceKey, listA)
+      }
+      listA.push(nodeB)
+
+      let listB = overlapAdjacency.get(nodeB.sourceKey)
+      if (!listB) {
+        listB = []
+        overlapAdjacency.set(nodeB.sourceKey, listB)
+      }
+      listB.push(nodeA)
+    }
+  }
+
+  const passthroughRegions: TopologyMergingRegion[] = []
+  const interactiveNodes: PreparedTopologyMergingNode[] = []
+
+  for (const preparedNode of preparedNodes) {
+    if (interactiveKeys.has(preparedNode.sourceKey)) {
+      interactiveNodes.push(preparedNode)
+      continue
+    }
+    const mode =
+      preparedNode.node._containsObstacle && preparedNode.node._containsTarget
+        ? ("target-passthrough" as const)
+        : ("passthrough" as const)
+    passthroughRegions.push({
+      bounds: { ...preparedNode.bounds },
+      availableZ: [...preparedNode.node.availableZ],
+      sourceKeys: [preparedNode.sourceKey],
+      topologyMode: mode,
+      topologySignature: JSON.stringify({
+        mode,
+        sourceKeys: [preparedNode.sourceKey],
+      }),
+    })
+  }
+
+  const visitedKeys = new Set<string>()
+  const xSlabs: TopologyMergingXSlab[] = []
+
+  for (const seedNode of interactiveNodes) {
+    if (visitedKeys.has(seedNode.sourceKey)) continue
+    const clusterNodes: PreparedTopologyMergingNode[] = []
+    const queue: PreparedTopologyMergingNode[] = [seedNode]
+    visitedKeys.add(seedNode.sourceKey)
+
+    while (queue.length > 0) {
+      const current = queue.pop()!
+      clusterNodes.push(current)
+      for (const neighbor of overlapAdjacency.get(current.sourceKey) ?? []) {
+        if (!visitedKeys.has(neighbor.sourceKey)) {
+          visitedKeys.add(neighbor.sourceKey)
+          queue.push(neighbor)
+        }
+      }
+    }
+
+    const xCoordinates = getCanonicalCoordinates(
+      clusterNodes.flatMap(({ bounds }) => [bounds.minX, bounds.maxX]),
+    )
+    for (let xIndex = 0; xIndex < xCoordinates.length - 1; xIndex++) {
+      const minX = xCoordinates[xIndex]!
+      const maxX = xCoordinates[xIndex + 1]!
+      if (maxX - minX <= TOPOLOGY_MERGING_EPSILON) continue
+      const x = (minX + maxX) / 2
+      const nodesInXSlab = clusterNodes.filter(
+        ({ bounds }) =>
+          x >= bounds.minX - TOPOLOGY_MERGING_EPSILON &&
+          x <= bounds.maxX + TOPOLOGY_MERGING_EPSILON,
+      )
+      if (nodesInXSlab.length > 0) {
+        xSlabs.push({ minX, maxX, nodes: nodesInXSlab })
+      }
+    }
+  }
+
+  return { passthroughRegions, xSlabs }
+}
+
 export class TopologyMergingSolver extends BaseSolver {
   private readonly preparedNodes: PreparedTopologyMergingNode[]
   private readonly preparedNodeBySourceKey: Map<
@@ -37,7 +197,8 @@ export class TopologyMergingSolver extends BaseSolver {
     groupIndexesByNodeId: new Map<string, number[]>(),
     sourceKeysByNodeId: new Map<string, string[]>(),
   }
-  private readonly xCoordinates: number[]
+  private readonly passthroughRegions: TopologyMergingRegion[]
+  private readonly xSlabs: TopologyMergingXSlab[]
   private readonly atomicRegions: TopologyMergingRegion[] = []
   private outputNodes: CapacityMeshNode[] = []
   private currentXIndex = 0
@@ -50,12 +211,20 @@ export class TopologyMergingSolver extends BaseSolver {
       prepareTopologyMergingInput(inputProblem)
     this.preparedNodes = preparedNodes
     this.preparedNodeBySourceKey = preparedNodeBySourceKey
-    this.xCoordinates = getCanonicalCoordinates(
-      this.preparedNodes.flatMap(({ bounds }) => [bounds.minX, bounds.maxX]),
-    )
+    const { passthroughRegions, xSlabs } =
+      inputProblem.nodeGroups.length <= 1
+        ? { passthroughRegions: [], xSlabs: [] }
+        : this.preparedNodes.length <= 500
+          ? {
+              passthroughRegions: [],
+              xSlabs: buildFullXSlabs(this.preparedNodes),
+            }
+          : buildInteractiveClustersAndPassthroughRegions(this.preparedNodes)
+    this.passthroughRegions = passthroughRegions
+    this.xSlabs = xSlabs
     this.stats = {
       inputNodeCount: this.preparedNodes.length,
-      xSlabCount: Math.max(0, this.xCoordinates.length - 1),
+      xSlabCount: this.xSlabs.length,
       processedXSlabCount: 0,
       atomicRegionCount: 0,
       outputNodeCount: 0,
@@ -72,7 +241,7 @@ export class TopologyMergingSolver extends BaseSolver {
       return
     }
 
-    if (this.currentXIndex < this.xCoordinates.length - 1) {
+    if (this.currentXIndex < this.xSlabs.length) {
       this.processCurrentXSlab()
       this.currentXIndex += 1
       this.stats.processedXSlabCount = this.currentXIndex
@@ -84,7 +253,10 @@ export class TopologyMergingSolver extends BaseSolver {
       regions: this.atomicRegions,
       preparedNodeBySourceKey: this.preparedNodeBySourceKey,
     })
-    const compactedRegions = compactTopologyMergingRegions(topologyRegions)
+    const compactedRegions = [
+      ...this.passthroughRegions,
+      ...compactTopologyMergingRegions(topologyRegions),
+    ]
     this.outputNodes = createTopologyMergingOutputNodes({
       regions: compactedRegions,
       preparedNodeBySourceKey: this.preparedNodeBySourceKey,
@@ -112,7 +284,7 @@ export class TopologyMergingSolver extends BaseSolver {
   }
 
   computeProgress(): number {
-    const slabCount = Math.max(1, this.xCoordinates.length - 1)
+    const slabCount = Math.max(1, this.xSlabs.length)
     if (this.solved) return 1
     return Math.min(0.99, this.currentXIndex / slabCount)
   }
@@ -121,7 +293,7 @@ export class TopologyMergingSolver extends BaseSolver {
     const nodes = this.solved
       ? this.outputNodes
       : createTopologyMergingOutputNodes({
-          regions: this.atomicRegions,
+          regions: [...this.passthroughRegions, ...this.atomicRegions],
           preparedNodeBySourceKey: this.preparedNodeBySourceKey,
           nodeGroups: this.inputProblem.nodeGroups,
           provenance: this.outputProvenance,
@@ -169,16 +341,11 @@ export class TopologyMergingSolver extends BaseSolver {
   }
 
   private processCurrentXSlab(): void {
-    const minX = this.xCoordinates[this.currentXIndex]!
-    const maxX = this.xCoordinates[this.currentXIndex + 1]!
+    const slab = this.xSlabs[this.currentXIndex]!
+    const { minX, maxX, nodes: nodesInXSlab } = slab
     if (maxX - minX <= TOPOLOGY_MERGING_EPSILON) return
 
     const x = (minX + maxX) / 2
-    const nodesInXSlab = this.preparedNodes.filter(
-      ({ bounds }) =>
-        x >= bounds.minX - TOPOLOGY_MERGING_EPSILON &&
-        x <= bounds.maxX + TOPOLOGY_MERGING_EPSILON,
-    )
     const yCoordinates = getCanonicalCoordinates(
       nodesInXSlab.flatMap(({ bounds }) => [bounds.minY, bounds.maxY]),
     )

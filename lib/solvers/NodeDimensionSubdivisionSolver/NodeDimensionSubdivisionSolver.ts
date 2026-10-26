@@ -72,12 +72,15 @@ export class NodeDimensionSubdivisionSolver extends BaseSolver {
       return true
     }
 
-    if (!hasMinAreaLimit || node.width * node.height >= this.minNodeArea) {
-      return false
+    if (
+      hasMinAreaLimit &&
+      Math.min(node.width, node.height) < MIN_CONNECTIVITY_BRIDGE_DIMENSION
+    ) {
+      return true
     }
 
-    if (Math.min(node.width, node.height) < MIN_CONNECTIVITY_BRIDGE_DIMENSION) {
-      return true
+    if (!hasMinAreaLimit || node.width * node.height >= this.minNodeArea) {
+      return false
     }
 
     if (node._containsTarget) return false

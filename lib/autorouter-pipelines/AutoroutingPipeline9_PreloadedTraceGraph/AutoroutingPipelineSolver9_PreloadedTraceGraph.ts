@@ -365,6 +365,22 @@ export class AutoroutingPipelineSolver9_PreloadedTraceGraph extends BaseSolver {
           cms.connMap = getConnectivityMapFromSimpleRouteJson(
             cms.srjWithPointPairs!,
           )
+          const connections = cms.netToPointPairsSolver?.newConnections ?? []
+          for (const pair of cms.srj.differentialPairs ?? []) {
+            for (const connectionName of pair.connectionNames) {
+              const matchingConnections = connections.filter(
+                (connection) =>
+                  connection.name === connectionName ||
+                  connection.__rootConnectionNames?.includes(connectionName) ||
+                  connection.__netConnectionName === connectionName,
+              )
+              if (matchingConnections.length !== 1) {
+                cms.error = `Pipeline9: differential pair connection "${connectionName}" must resolve to exactly one final point-pair connection, got ${matchingConnections.length}`
+                cms.failed = true
+                return
+              }
+            }
+          }
         },
       },
     ),
@@ -1156,6 +1172,7 @@ export class AutoroutingPipelineSolver9_PreloadedTraceGraph extends BaseSolver {
           this.startTimeOfPhase[pipelineStepDef.solverName]
         pipelineStepDef.onSolved?.(this)
         this.activeSubSolver = null
+        if (this.failed) return
         this.currentPipelineStepIndex++
       } else if (this.activeSubSolver.failed) {
         this.error = this.activeSubSolver?.error
