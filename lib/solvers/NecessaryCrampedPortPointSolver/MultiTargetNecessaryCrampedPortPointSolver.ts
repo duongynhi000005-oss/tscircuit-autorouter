@@ -22,6 +22,8 @@ export type MultiTargetNecessaryCrampedPortPointSolverInput = {
   sharedEdgeSegments: SharedEdgeSegment[]
   capacityMeshNodes: CapacityMeshNode[]
   simpleRouteJson: SimpleRouteJson
+  allCapacityMeshNodes?: CapacityMeshNode[]
+  allSharedEdgeSegments?: SharedEdgeSegment[]
 }
 
 /**
@@ -242,26 +244,300 @@ export class MultiTargetNecessaryCrampedPortPointSolver extends BaseSolver {
       return this.filteredOutput
     }
 
-    this.filteredOutput = this.input.sharedEdgeSegments.map((segment) => ({
-      ...segment,
-      portPoints: segment.portPoints.flatMap((portPoint) => {
-        if (!portPoint.cramped || this.crampedPortPointsToKeep.has(portPoint)) {
-          return [portPoint]
-        }
+    const initialFilteredSegments = this.input.sharedEdgeSegments.map(
+      (segment) => ({
+        ...segment,
+        portPoints: segment.portPoints.flatMap((portPoint) => {
+          if (
+            !portPoint.cramped ||
+            this.crampedPortPointsToKeep.has(portPoint)
+          ) {
+            return [portPoint]
+          }
 
-        if (this.isMultilayerEscapePort(portPoint)) {
-          return [
-            {
-              ...portPoint,
-              tinyHypergraphPortPenalty: CRAMPED_NON_NECESSARY_PORT_PENALTY,
-            },
-          ]
-        }
+          if (this.isMultilayerEscapePort(portPoint)) {
+            return [
+              {
+                ...portPoint,
+                tinyHypergraphPortPenalty: CRAMPED_NON_NECESSARY_PORT_PENALTY,
+              },
+            ]
+          }
 
-        return []
+          return []
+        }),
       }),
-    }))
+    )
+
+    this.filteredOutput = this.retainReachabilityBridgeCrampedPortPoints(
+      initialFilteredSegments,
+    )
     return this.filteredOutput
+  }
+
+  private retainReachabilityBridgeCrampedPortPoints(
+    filteredSegments: SharedEdgeSegment[],
+  ): SharedEdgeSegment[] {
+    const allNodes =
+      this.input.allCapacityMeshNodes ?? this.input.capacityMeshNodes
+    const allSegments =
+      this.input.allSharedEdgeSegments ?? this.input.sharedEdgeSegments
+    const allNodeMap = new Map<CapacityMeshNodeId, CapacityMeshNode>()
+    const obstacleNodes: CapacityMeshNode[] = []
+    for (const node of allNodes) {
+      allNodeMap.set(node.capacityMeshNodeId, node)
+      if (node._containsObstacle) {
+        obstacleNodes.push(node)
+      }
+    }
+
+    const findTargetNodes = (point: {
+      x: number
+      y: number
+    }): CapacityMeshNode[] =>
+      obstacleNodes.filter((node) => pointToBoxDistance(point, node) <= 0)
+
+    const connectionNodePairs = this.input.simpleRouteJson.connections
+      .filter((connection) => connection.pointsToConnect.length >= 2)
+      .map((connection) => ({
+        startNodes: findTargetNodes(connection.pointsToConnect[0]!),
+        endNodes: findTargetNodes(
+          connection.pointsToConnect[connection.pointsToConnect.length - 1]!,
+        ),
+      }))
+      .filter(
+        (pair) => pair.startNodes.length > 0 && pair.endNodes.length > 0,
+      )
+
+    if (connectionNodePairs.length === 0) {
+      return filteredSegments
+    }
+
+    const filteredSegmentsByEdgeId = new Map<string, SharedEdgeSegment>(
+      filteredSegments.map((segment) => [segment.edgeId, segment]),
+    )
+
+    const getEffectiveFilteredPortPoints = (
+      segment: SharedEdgeSegment,
+    ): SegmentPortPoint[] => {
+      const filteredSegment = filteredSegmentsByEdgeId.get(segment.edgeId)
+      return filteredSegment ? filteredSegment.portPoints : segment.portPoints
+    }
+
+    const filteredAdj = new Map<CapacityMeshNodeId, CapacityMeshNodeId[]>()
+    for (const segment of allSegments) {
+      if (getEffectiveFilteredPortPoints(segment).length === 0) continue
+      const [a, b] = segment.nodeIds
+      let adjA = filteredAdj.get(a)
+      if (!adjA) {
+        adjA = []
+        filteredAdj.set(a, adjA)
+      }
+      adjA.push(b)
+      let adjB = filteredAdj.get(b)
+      if (!adjB) {
+        adjB = []
+        filteredAdj.set(b, adjB)
+      }
+      adjB.push(a)
+    }
+
+    const canReachTarget = (
+      startNodes: CapacityMeshNode[],
+      endIds: Set<CapacityMeshNodeId>,
+    ): boolean => {
+      const startIds = new Set(
+        startNodes.map((node) => node.capacityMeshNodeId),
+      )
+      const visited = new Set<CapacityMeshNodeId>(startIds)
+      const queue = [...startIds]
+      let head = 0
+      while (head < queue.length) {
+        const currentId = queue[head++]!
+        if (endIds.has(currentId)) {
+          return true
+        }
+        const currentNode = allNodeMap.get(currentId)
+        if (currentNode?._containsObstacle && !startIds.has(currentId)) {
+          continue
+        }
+        for (const neighborId of filteredAdj.get(currentId) ?? []) {
+          if (visited.has(neighborId)) continue
+          const neighborNode = allNodeMap.get(neighborId)
+          if (neighborNode?._containsObstacle && !endIds.has(neighborId)) {
+            continue
+          }
+          visited.add(neighborId)
+          queue.push(neighborId)
+        }
+      }
+      return false
+    }
+
+    const disconnectedPairs = connectionNodePairs.filter((pair) => {
+      const endIds = new Set(
+        pair.endNodes.map((node) => node.capacityMeshNodeId),
+      )
+      return !canReachTarget(pair.startNodes, endIds)
+    })
+
+    if (disconnectedPairs.length === 0) {
+      return filteredSegments
+    }
+
+    const fullAdj = new Map<
+      CapacityMeshNodeId,
+      Array<{
+        to: CapacityMeshNodeId
+        edgeId: string
+        isDroppedCramped: boolean
+      }>
+    >()
+    for (const segment of allSegments) {
+      if (segment.portPoints.length === 0) continue
+      const [a, b] = segment.nodeIds
+      const isDroppedCramped =
+        getEffectiveFilteredPortPoints(segment).length === 0
+      let adjA = fullAdj.get(a)
+      if (!adjA) {
+        adjA = []
+        fullAdj.set(a, adjA)
+      }
+      adjA.push({ to: b, edgeId: segment.edgeId, isDroppedCramped })
+      let adjB = fullAdj.get(b)
+      if (!adjB) {
+        adjB = []
+        fullAdj.set(b, adjB)
+      }
+      adjB.push({ to: a, edgeId: segment.edgeId, isDroppedCramped })
+    }
+
+    const bridgeEdgeIds = new Set<string>()
+    for (const { startNodes, endNodes } of disconnectedPairs) {
+      const startIds = new Set(
+        startNodes.map((node) => node.capacityMeshNodeId),
+      )
+      const endIds = new Set(endNodes.map((node) => node.capacityMeshNodeId))
+      const usedEdgeIdsInConnection = new Set<string>()
+
+      for (
+        let branch = 0;
+        branch < MAX_CRAMPED_ESCAPE_BRANCHES_TO_KEEP;
+        branch++
+      ) {
+        const dist = new Map<CapacityMeshNodeId, number>()
+        const parent = new Map<
+          CapacityMeshNodeId,
+          {
+            from: CapacityMeshNodeId
+            edgeId: string
+            isDroppedCramped: boolean
+          }
+        >()
+        const heap: Array<{ d: number; u: CapacityMeshNodeId }> = []
+        const push = (d: number, u: CapacityMeshNodeId) => {
+          heap.push({ d, u })
+          let index = heap.length - 1
+          while (index > 0) {
+            const parentIndex = (index - 1) >> 1
+            if (heap[parentIndex]!.d <= d) break
+            heap[index] = heap[parentIndex]!
+            index = parentIndex
+          }
+          heap[index] = { d, u }
+        }
+        const pop = () => {
+          const top = heap[0]
+          const last = heap.pop()
+          if (heap.length > 0 && last) {
+            let index = 0
+            while (true) {
+              const left = index * 2 + 1
+              if (left >= heap.length) break
+              const right = left + 1
+              const child =
+                right < heap.length && heap[right]!.d < heap[left]!.d
+                  ? right
+                  : left
+              if (heap[child]!.d >= last.d) break
+              heap[index] = heap[child]!
+              index = child
+            }
+            heap[index] = last
+          }
+          return top
+        }
+
+        for (const startId of startIds) {
+          dist.set(startId, 0)
+          push(0, startId)
+        }
+
+        let reachedEndId: CapacityMeshNodeId | undefined
+        while (heap.length > 0) {
+          const { d, u } = pop()!
+          if (d > (dist.get(u) ?? Infinity)) continue
+          if (endIds.has(u)) {
+            reachedEndId = u
+            break
+          }
+          const currentNode = allNodeMap.get(u)
+          if (currentNode?._containsObstacle && !startIds.has(u)) continue
+          for (const edge of fullAdj.get(u) ?? []) {
+            const neighborNode = allNodeMap.get(edge.to)
+            if (neighborNode?._containsObstacle && !endIds.has(edge.to)) {
+              continue
+            }
+            const stepCost = !edge.isDroppedCramped
+              ? 1
+              : usedEdgeIdsInConnection.has(edge.edgeId)
+                ? 10_000
+                : 100
+            const nextDist = d + stepCost
+            if (nextDist < (dist.get(edge.to) ?? Infinity)) {
+              dist.set(edge.to, nextDist)
+              parent.set(edge.to, {
+                from: u,
+                edgeId: edge.edgeId,
+                isDroppedCramped: edge.isDroppedCramped,
+              })
+              push(nextDist, edge.to)
+            }
+          }
+        }
+
+        if (!reachedEndId) break
+        let currentId: CapacityMeshNodeId | undefined = reachedEndId
+        while (currentId && !startIds.has(currentId)) {
+          const step = parent.get(currentId)
+          if (!step) break
+          if (step.isDroppedCramped) {
+            bridgeEdgeIds.add(step.edgeId)
+            usedEdgeIdsInConnection.add(step.edgeId)
+          }
+          currentId = step.from
+        }
+      }
+    }
+
+    if (bridgeEdgeIds.size === 0) {
+      return filteredSegments
+    }
+
+    return filteredSegments.map((segment, index) => {
+      if (!bridgeEdgeIds.has(segment.edgeId) || segment.portPoints.length > 0) {
+        return segment
+      }
+      return {
+        ...segment,
+        portPoints: this.input.sharedEdgeSegments[index]!.portPoints.map(
+          (portPoint) => ({
+            ...portPoint,
+            tinyHypergraphPortPenalty: CRAMPED_NON_NECESSARY_PORT_PENALTY,
+          }),
+        ),
+      }
+    })
   }
 
   private getCandidateExitCapacity(candidate: ExploredPortPoint): number {

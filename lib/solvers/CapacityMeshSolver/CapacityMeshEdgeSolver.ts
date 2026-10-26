@@ -58,23 +58,87 @@ export class CapacityMeshEdgeSolver extends BaseSolver {
 
   handleTargetNodes() {
     const targetNodes = this.nodes.filter((node) => node._containsTarget)
+    if (targetNodes.length === 0) return
+
     const nodeById = new Map(
       this.nodes.map((node) => [node.capacityMeshNodeId, node]),
     )
+    const existingEdgeKeys = new Set<string>()
+    const neighborIdsByNodeId = new Map<string, string[]>()
 
-    for (let i = 0; i < targetNodes.length; i++) {
-      for (let j = i + 1; j < targetNodes.length; j++) {
-        const nodeA = targetNodes[i]!
-        const nodeB = targetNodes[j]!
+    const recordEdge = (idA: string, idB: string): void => {
+      existingEdgeKeys.add(`${idA}\0${idB}`)
+      existingEdgeKeys.add(`${idB}\0${idA}`)
+      let neighborsA = neighborIdsByNodeId.get(idA)
+      if (!neighborsA) {
+        neighborsA = []
+        neighborIdsByNodeId.set(idA, neighborsA)
+      }
+      neighborsA.push(idB)
+      let neighborsB = neighborIdsByNodeId.get(idB)
+      if (!neighborsB) {
+        neighborsB = []
+        neighborIdsByNodeId.set(idB, neighborsB)
+      }
+      neighborsB.push(idA)
+    }
+
+    for (const edge of this.edges) {
+      recordEdge(edge.nodeIds[0], edge.nodeIds[1])
+    }
+
+    const epsilon = 0.001
+    const sortedIndices = Array.from(
+      { length: targetNodes.length },
+      (_, i) => i,
+    ).sort(
+      (a, b) =>
+        targetNodes[a]!.center.x -
+        targetNodes[a]!.width / 2 -
+        (targetNodes[b]!.center.x - targetNodes[b]!.width / 2),
+    )
+
+    const newTargetPairs: Array<[number, number]> = []
+    for (let i = 0; i < sortedIndices.length; i++) {
+      const idxA = sortedIndices[i]!
+      const nodeA = targetNodes[idxA]!
+      const rightA = nodeA.center.x + nodeA.width / 2
+      for (let j = i + 1; j < sortedIndices.length; j++) {
+        const idxB = sortedIndices[j]!
+        const nodeB = targetNodes[idxB]!
+        const leftB = nodeB.center.x - nodeB.width / 2
+        if (leftB > rightA + epsilon) {
+          break
+        }
         if (!this.doNodesHaveSharedLayer(nodeA, nodeB)) continue
         if (!this.doNodesTouchOrOverlap(nodeA, nodeB)) continue
-        if (this.hasEdgeBetween(nodeA, nodeB)) continue
-
-        this.edges.push({
-          capacityMeshEdgeId: this.getNextCapacityMeshEdgeId(),
-          nodeIds: [nodeA.capacityMeshNodeId, nodeB.capacityMeshNodeId],
-        })
+        if (
+          existingEdgeKeys.has(
+            `${nodeA.capacityMeshNodeId}\0${nodeB.capacityMeshNodeId}`,
+          )
+        ) {
+          continue
+        }
+        newTargetPairs.push([Math.min(idxA, idxB), Math.max(idxA, idxB)])
       }
+    }
+
+    newTargetPairs.sort((a, b) => a[0] - b[0] || a[1] - b[1])
+    for (const [idxA, idxB] of newTargetPairs) {
+      const nodeA = targetNodes[idxA]!
+      const nodeB = targetNodes[idxB]!
+      if (
+        existingEdgeKeys.has(
+          `${nodeA.capacityMeshNodeId}\0${nodeB.capacityMeshNodeId}`,
+        )
+      ) {
+        continue
+      }
+      recordEdge(nodeA.capacityMeshNodeId, nodeB.capacityMeshNodeId)
+      this.edges.push({
+        capacityMeshEdgeId: this.getNextCapacityMeshEdgeId(),
+        nodeIds: [nodeA.capacityMeshNodeId, nodeB.capacityMeshNodeId],
+      })
     }
 
     for (const targetNode of targetNodes) {
@@ -82,12 +146,9 @@ export class CapacityMeshEdgeSolver extends BaseSolver {
         continue
       }
 
-      const hasRoutingEdge = this.edges.some((edge) => {
-        if (!edge.nodeIds.includes(targetNode.capacityMeshNodeId)) return false
-        const otherNodeId =
-          edge.nodeIds[0] === targetNode.capacityMeshNodeId
-            ? edge.nodeIds[1]
-            : edge.nodeIds[0]
+      const neighborIds =
+        neighborIdsByNodeId.get(targetNode.capacityMeshNodeId) ?? []
+      const hasRoutingEdge = neighborIds.some((otherNodeId) => {
         const otherNode = nodeById.get(otherNodeId)
         if (!otherNode) return false
 

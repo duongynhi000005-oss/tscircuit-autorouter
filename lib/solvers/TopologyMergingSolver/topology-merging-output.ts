@@ -125,7 +125,9 @@ export function validateTopologyMergingOutput({
   provenance: TopologyMergingOutputProvenance
 }): void {
   const nodeIds = new Set<string>()
-  for (const node of nodes) {
+  const boundsByIndex: Bounds[] = new Array(nodes.length)
+  for (let index = 0; index < nodes.length; index++) {
+    const node = nodes[index]!
     if (nodeIds.has(node.capacityMeshNodeId)) {
       throw new Error(
         `TopologyMergingSolver: duplicate output node id "${node.capacityMeshNodeId}"`,
@@ -133,7 +135,9 @@ export function validateTopologyMergingOutput({
     }
     nodeIds.add(node.capacityMeshNodeId)
 
-    if (!isValidCapacityBounds(getCapacityMeshNodeBounds(node))) {
+    const bounds = getCapacityMeshNodeBounds(node)
+    boundsByIndex[index] = bounds
+    if (!isValidCapacityBounds(bounds)) {
       throw new Error(
         `TopologyMergingSolver: output node "${node.capacityMeshNodeId}" has invalid bounds`,
       )
@@ -161,9 +165,39 @@ export function validateTopologyMergingOutput({
     }
   }
 
-  for (let aIndex = 0; aIndex < nodes.length; aIndex++) {
-    const nodeA = nodes[aIndex]!
-    for (let bIndex = aIndex + 1; bIndex < nodes.length; bIndex++) {
+  const sortedIndices = Array.from({ length: nodes.length }, (_, i) => i).sort(
+    (a, b) => boundsByIndex[a]!.minX - boundsByIndex[b]!.minX || a - b,
+  )
+  let bestViolation: { aIndex: number; bIndex: number; error: Error } | null =
+    null
+
+  for (let i = 0; i < sortedIndices.length; i++) {
+    const rawA = sortedIndices[i]!
+    const boundsRawA = boundsByIndex[rawA]!
+    for (let j = i + 1; j < sortedIndices.length; j++) {
+      const rawB = sortedIndices[j]!
+      const boundsRawB = boundsByIndex[rawB]!
+      if (boundsRawB.minX > boundsRawA.maxX) {
+        break
+      }
+      if (
+        boundsRawB.maxY < boundsRawA.minY ||
+        boundsRawB.minY > boundsRawA.maxY
+      ) {
+        continue
+      }
+
+      const aIndex = Math.min(rawA, rawB)
+      const bIndex = Math.max(rawA, rawB)
+      if (
+        bestViolation &&
+        (aIndex > bestViolation.aIndex ||
+          (aIndex === bestViolation.aIndex && bIndex >= bestViolation.bIndex))
+      ) {
+        continue
+      }
+
+      const nodeA = nodes[aIndex]!
       const nodeB = nodes[bIndex]!
       const sharedLayers = nodeA.availableZ.filter((z) =>
         nodeB.availableZ.includes(z),
@@ -171,8 +205,8 @@ export function validateTopologyMergingOutput({
       if (sharedLayers.length === 0) continue
 
       const intersection = getBoundsIntersection(
-        getCapacityMeshNodeBounds(nodeA),
-        getCapacityMeshNodeBounds(nodeB),
+        boundsByIndex[aIndex]!,
+        boundsByIndex[bIndex]!,
       )
       if (!intersection) continue
       const intersectionWidth = intersection.maxX - intersection.minX
@@ -191,9 +225,14 @@ export function validateTopologyMergingOutput({
         nodeB.capacityMeshNodeId,
       )
       if (!nodeAGroupIndexes || !nodeBGroupIndexes) {
-        throw new Error(
-          `TopologyMergingSolver: missing output provenance for overlapping nodes "${nodeA.capacityMeshNodeId}" and "${nodeB.capacityMeshNodeId}"`,
-        )
+        bestViolation = {
+          aIndex,
+          bIndex,
+          error: new Error(
+            `TopologyMergingSolver: missing output provenance for overlapping nodes "${nodeA.capacityMeshNodeId}" and "${nodeB.capacityMeshNodeId}"`,
+          ),
+        }
+        continue
       }
       const nodeASourceKeys = provenance.sourceKeysByNodeId.get(
         nodeA.capacityMeshNodeId,
@@ -202,9 +241,14 @@ export function validateTopologyMergingOutput({
         nodeB.capacityMeshNodeId,
       )
       if (!nodeASourceKeys || !nodeBSourceKeys) {
-        throw new Error(
-          `TopologyMergingSolver: missing source provenance for overlapping nodes "${nodeA.capacityMeshNodeId}" and "${nodeB.capacityMeshNodeId}"`,
-        )
+        bestViolation = {
+          aIndex,
+          bIndex,
+          error: new Error(
+            `TopologyMergingSolver: missing source provenance for overlapping nodes "${nodeA.capacityMeshNodeId}" and "${nodeB.capacityMeshNodeId}"`,
+          ),
+        }
+        continue
       }
       if (
         isPreservedSameGroupOverlap({
@@ -219,10 +263,18 @@ export function validateTopologyMergingOutput({
         continue
       }
 
-      throw new Error(
-        `TopologyMergingSolver: output nodes "${nodeA.capacityMeshNodeId}" and "${nodeB.capacityMeshNodeId}" have an unresolved inter-group overlap on a shared layer`,
-      )
+      bestViolation = {
+        aIndex,
+        bIndex,
+        error: new Error(
+          `TopologyMergingSolver: output nodes "${nodeA.capacityMeshNodeId}" and "${nodeB.capacityMeshNodeId}" have an unresolved inter-group overlap on a shared layer`,
+        ),
+      }
     }
+  }
+
+  if (bestViolation) {
+    throw bestViolation.error
   }
 }
 
